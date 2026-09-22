@@ -1,0 +1,108 @@
+# concurrent-task-runtime-go
+
+进程内并发任务运行时：在**优先级、分组配额、取消与关停**等条件下，
+保证任务的执行结果与资源占用可预期。仅依赖 Go 标准库。
+
+## 快速开始
+
+```go
+rt := taskrt.New(taskrt.Config{
+    MaxConcurrency: 8,
+    QueueCapacity:  1024,
+    GroupQuotas:    map[string]int{"batch": 2},
+})
+
+h, err := rt.Submit(taskrt.Task{
+    ID:       "job-1",
+    Group:    "batch",
+    Priority: 5,
+    Timeout:  2 * time.Second,
+    Func: func(ctx context.Context) (any, error) {
+        // 业务逻辑；应响应 ctx 取消
+        return "done", nil
+    },
+    OnComplete: func(res taskrt.Result) { /* 仅 Completed/Failed 触发 */ },
+})
+if err != nil {
+    if re, ok := taskrt.AsReject(err); ok {
+        // re.Reason: QueueFull / GroupQueueFull / Shutdown
+    }
+}
+res := h.Wait() // 阻塞到终态
+_ = rt.Shutdown(context.Background())
+```
+
+## 调度与配额规则
+
+- **并发上限**：同时在执行的任务数不超过 `MaxConcurrency`（默认 4）。
+- **排队容量**：全局排队数不超过 `QueueCapacity`（默认 1024）；单分组排队数
+  不超过 `GroupQueueLimit`（默认不限）。超限即拒绝，绝不静默丢弃。
+- **拒绝可区分**：拒绝返回 `*RejectError`，用 `AsReject` 提取原因：
+  `RejectQueueFull`（全局满）、`RejectGroupQueueFull`（分组排队满）、
+  `RejectShutdown`（已关停）。被拒绝的任务不入队、不执行、不计入执行统计。
+- **优先级 + 老化防饥饿**：调度器每次选取**有效优先级**最高的任务：
+  `有效优先级 = Priority + 等待时长 / AgingInterval`（默认 100ms 升 1 级）。
+  低优先级任务等待越久优先级越高，因此高优先级流量无法完全饿死低优先级。
+  同有效（老化后）有效优先级按入队先后 FIFO。
+- **分组配额**：`GroupQuotas[group]`（缺省用 `DefaultGroupQuota`，0 表示不限）
+  限制该分组**同时在执行**的任务数。配额用尽的分组任务留在队列中等待，
+  不得越额执行；其他分组不受影响。
+- **调度复杂度**：调度决策为 O(队列长度) 扫描，队列长度受 `QueueCapacity`
+  约束，故开销与内存占用均有界；单调度协程 + 有界工作协程，无额外后台 goroutine。
+
+## 取消、超时与终态
+
+任务终态：`Completed` / `Failed` / `Canceled` / `TimedOut`（`Rejected` 仅出现在
+提交返回值中，任务未入队）。
+
+- `Handle.Cancel()`：排队中的任务直接移除并终结为 `Canceled`；执行中的任务
+  其 `ctx` 被取消。
+- `Task.Timeout`：从**开始执行**计时，超时终态为 `TimedOut`。
+- **被取消或超时的任务不产生任何副作用**：结果值被丢弃（`Result.Value == nil`）、
+  `OnComplete` 不触发；即使任务体在取消后返回了值也会被运行时丢弃。
+- **三类失败区分上报**：业务失败（`Failed`，`Err` 为任务体返回的 error）、
+  执行超时（`TimedOut`）、调度层拒绝（提交时返回 `*RejectError`）。
+  任务体 panic 被 recover 并记为 `Failed`，不会污染运行时状态。
+- 取消与完成的竞争由互斥锁 + `context.Cause` 裁定：每个任务**恰好**到达一个
+  终态，`Handle.done` 恰好关闭一次。
+
+## 统计口径
+
+`Runtime.Metrics()` 返回快照，全部经原子操作更新、并发安全：
+
+| 字段 | 口径 |
+|---|---|
+| `Accepted` | 入队成功的任务数 |
+| `Rejected` | 被拒绝的任务数 |
+| `Started` | 真实开始执行的任务数（取消发生在执行前则不计） |
+| `Completed/Failed/Canceled/TimedOut` | 各终态计数，每任务恰好计一次 |
+| `Queued/Running` | 当前排队/执行数 |
+
+静默时刻恒等式：`Accepted = Completed + Failed + Canceled + TimedOut`，
+且 `Started = Completed + Failed + 执行中被取消/超时的数量`。
+
+## 优雅关停语义
+
+`Shutdown(ctx)`：
+
+1. 立即拒收新任务（`RejectShutdown`），可重复调用（幂等）。
+2. 已排队与执行中的任务继续调度执行，在 `ShutdownTimeout`（默认 5s）内收敛。
+3. 超时后**强制收敛**：排队任务全部以 `Canceled` 终结，执行中任务的 `ctx`
+   被取消（`context.Cause` 为强制关停原因），再等待一个同等宽限期。
+4. 全部后台协程（调度协程 + 工作协程）退出后返回 `nil`。
+   若任务体不响应 `ctx` 取消，宽限期后返回 `ErrShutdownTimeout`——
+   Go 无法强杀 goroutine，任务体必须响应 `ctx` 才能保证无泄漏。
+
+## 本地验证
+
+```bash
+go build ./...
+go vet ./...
+go test -race -count=1 -v ./...
+```
+
+测试覆盖：优先级饥饿（`TestPriorityNoStarvation`）、配额越界
+（`TestGroupQuotaNotExceeded`）、取消竞争（`TestCancelRace` 等）、
+关停边界（`TestShutdownDrains` / `TestShutdownForced`，含协程泄漏检查）、
+队列溢出（`TestQueueOverflow`）、混合负载开销（`TestMixedLoadOverhead`）。
+每个用例都在日志中打印输入参数与判定依据（`t.Logf`），可用 `-v` 复现结论。
