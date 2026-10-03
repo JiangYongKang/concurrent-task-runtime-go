@@ -53,6 +53,7 @@ type Runtime struct {
 	queue        []*entry
 	groupQueued  map[string]int
 	groupRunning map[string]int
+	paused       map[string]struct{} // 暂停中的分组：其排队任务不得开始执行
 	runningSet   map[*entry]struct{}
 	running      int
 	seq          uint64
@@ -64,11 +65,13 @@ type Runtime struct {
 // New 创建并启动运行时。
 func New(cfg Config) *Runtime {
 	cfg = cfg.withDefaults()
+	cfg.GroupQuotas = cloneQuotaMap(cfg.GroupQuotas)
 	r := &Runtime{
 		cfg:          cfg,
 		queue:        nil,
 		groupQueued:  make(map[string]int),
 		groupRunning: make(map[string]int),
+		paused:       make(map[string]struct{}),
 		runningSet:   make(map[*entry]struct{}),
 		drained:      make(chan struct{}),
 	}
@@ -151,6 +154,9 @@ func (r *Runtime) pickLocked() *entry {
 	best := -1
 	bestEff := 0
 	for i, e := range r.queue {
+		if _, isPaused := r.paused[e.task.Group]; isPaused {
+			continue // 暂停中的分组：排队任务保留在队列中，不得开始执行
+		}
 		if q := r.cfg.quotaFor(e.task.Group); q > 0 && r.groupRunning[e.task.Group] >= q {
 			continue // 配额用尽的分组不得越额执行
 		}
@@ -323,6 +329,9 @@ func (r *Runtime) Shutdown(ctx context.Context) error {
 		}
 	}
 	r.state = stateDraining
+	// 关停优先收敛：放开所有分组暂停，使被暂停分组的排队任务
+	// 也能在优雅收敛期内参与调度；超时仍未收敛则统一强制取消。
+	r.paused = make(map[string]struct{})
 	r.cond.Broadcast()
 	r.mu.Unlock()
 

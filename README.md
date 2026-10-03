@@ -81,6 +81,71 @@ _ = rt.Shutdown(context.Background())
 静默时刻恒等式：`Accepted = Completed + Failed + Canceled + TimedOut`，
 且 `Started = Completed + Failed + 执行中被取消/超时的数量`。
 
+## 运行期动态调参（不重启、不重建）
+
+`UpdateConfig(ConfigUpdate)` 在运行中原子调整调度参数，**不需要也不能**
+重建运行时；排队容量、老化间隔等构造期参数不可运行期变更：
+
+```go
+defaultQuota := 4
+err := rt.UpdateConfig(taskrt.ConfigUpdate{
+    MaxConcurrency:    16,               // 正数：调整全局并发上限
+    DefaultGroupQuota: &defaultQuota,    // 非 nil：调整默认分组配额（0=不限）
+    GroupQuotas:       map[string]int{"batch": 6}, // 设置/覆盖单独配额（0=不限）
+    RemoveGroupQuotas: []string{"tmp"},  // 移除单独配额，回落默认配额
+})
+```
+
+- **字段零值语义**：`MaxConcurrency=0` 表示“该项不变更”；区分“不变更”与
+  “设为某值”的指针字段（`DefaultGroupQuota *int`）以及 map/slice 字段同理
+  （`nil` 表示不变更，空 map/空 slice 表示清空/移除零项，是合法操作）。
+- **整体校验、整体生效**：一次调用内的全部修改先在候选配置上校验，任一项
+  非法即整体拒绝，内部配置保持原样，不存在“改了一半”的中间态。
+  校验规则：`MaxConcurrency` 必须为正（要表达“不变更”请传 0）；各配额必须
+  非负（负数非法，`0` 表示不限制）；同一分组不能在同一次调用里既出现在
+  `GroupQuotas` 又出现在 `RemoveGroupQuotas`。
+- **错误可判定**（`errors.Is`）：`ErrInvalidMaxConcurrency`、
+  `ErrInvalidQuota`、`ErrQuotaConflict`；关停流程开始后调用返回
+  `ErrControlRejected`。
+- **生效语义**：变更生效后**正在执行的任务不受影响、照常跑完**；调度器立即
+  按新配置决策，排队任务继续被调度。把上限**调小**时不会中断在执行任务，
+  因此在它们自然收敛前，实际并发数可能瞬时高于新上限，但调度器不会再放行
+  任何会突破新上限的新任务；把配额/上限**调大**时排队任务立即补位。
+- 可用 `CurrentConfig()` 读取当前生效配置的**深拷贝**（与内部状态隔离，
+  修改返回值不会影响运行时）。
+
+## 分组暂停与恢复
+
+`PauseGroup(group)` / `ResumeGroup(group)` 对单个分组做临时停启：
+
+- **暂停只影响“启动决策”**：恢复之前该分组**排队中的任务不得开始执行**，
+  但该分组**已经在执行的任务可以自然结束**；暂停不取消任何任务。
+- **不拖累其他分组**：其他分组照常按各自配额调度，不会因为某分组被停下
+  而变慢或被饿死。
+- **恢复后重新参与公平调度**：排队任务立即回到老化优先级的公平选择中，
+  并遵守**恢复当时生效**的配额（可以先 `UpdateConfig` 再 `ResumeGroup`）。
+- **暂停期间其他操作语义不变**：提交照常入队（仍受全局/分组排队容量约束，
+  超限照常返回可区分的拒绝）；排队任务可被 `Cancel()` 立即移除并拿到
+  `Canceled` 终态；`Task.Timeout` 从**开始执行**计时，暂停排队期间不计时、
+  不会提前超时，恢复执行后超时照常生效。
+- 重复暂停返回 `ErrGroupPaused`，恢复未暂停的分组返回
+  `ErrGroupNotPaused`；可用 `IsGroupPaused(group)` 查询状态。
+
+### 暂停/调参与取消、关停的交互
+
+- 全部控制操作（提交、取消、`UpdateConfig`、`PauseGroup`、`ResumeGroup`、
+  `Shutdown`）在同一把调度锁下串行决策，与调度循环互斥：任何时刻的调度
+  都不会突破当时生效的并发上限与分组配额，统计口径保持准确，每个任务
+  恰好得到一个终态。
+- **关停优先于暂停**：`Shutdown` 开始时会自动放开所有分组的暂停，使被暂停
+  分组的排队任务也能在优雅收敛期内被调度执行；优雅期内未收敛的任务随
+  [强制收敛](#优雅关停语义) 以 `Canceled` 终结。因此即使某分组长期暂停，
+  关停也能正常收敛，关停返回后运行时彻底静止、无后台协程活动，所有已提交
+  任务都能通过各自的 `Handle` 拿到结论。
+- 关停流程开始后（Draining/Closed），`UpdateConfig`/`PauseGroup`/
+  `ResumeGroup` 一律返回 `ErrControlRejected`；并发调用的 `Shutdown`
+  仍然幂等。
+
 ## 优雅关停语义
 
 `Shutdown(ctx)`：
@@ -105,4 +170,19 @@ go test -race -count=1 -v ./...
 （`TestGroupQuotaNotExceeded`）、取消竞争（`TestCancelRace` 等）、
 关停边界（`TestShutdownDrains` / `TestShutdownForced`，含协程泄漏检查）、
 队列溢出（`TestQueueOverflow`）、混合负载开销（`TestMixedLoadOverhead`）。
+运行期能力新增覆盖：
+
+- 动态调参：`TestUpdateMaxConcurrencyScaleDownUp`（并发上限调小/调大的
+  在执行不受影响与严格补位）、`TestUpdateGroupQuotaScaleDownUpRemove`
+  （分组配额调小/调大/新增/移除）、`TestUpdateDefaultGroupQuota`
+  （默认配额调大/调小/置 0）、`TestUpdateConfigRejected` 与
+  `TestUpdateConfigAtomicCombined`（非法与冲突调整被拒、整体回滚）。
+- 暂停/恢复：`TestPauseResumeBasic`（在执行自然结束、排队不启动、他组不受
+  拖累、恢复遵守当时配额）、`TestPauseErrors`（重复暂停/误恢复报错）、
+  `TestPauseSubmitCancelTimeout`（暂停期间提交、取消、超时语义不变）。
+- 与关停交互：`TestShutdownDrainsPausedGroup`（被暂停分组排队任务优雅
+  收敛、关停后控制操作被拒）、`TestShutdownForcedWithPausedGroup`
+  （超时强收、句柄不卡死）、`TestConcurrentControlAndTraffic`（提交/取消/
+  调参/暂停恢复与关停同时发生的并发压测：终态恰好一次、统计守恒）。
+
 每个用例都在日志中打印输入参数与判定依据（`t.Logf`），可用 `-v` 复现结论。
