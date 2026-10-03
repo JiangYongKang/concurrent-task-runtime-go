@@ -50,6 +50,48 @@ _ = rt.Shutdown(context.Background())
 - **调度复杂度**：调度决策为 O(队列长度) 扫描，队列长度受 `QueueCapacity`
   约束，故开销与内存占用均有界；单调度协程 + 有界工作协程，无额外后台 goroutine。
 
+## 运行期动态调参
+
+无需重启或重建运行时，`UpdateConfig(ConfigUpdate)` 可原子地调整：
+
+- `MaxConcurrency`：并发执行上限（必须 > 0）；
+- `DefaultGroupQuota`：默认分组配额（必须 >= 0，0 表示不限）；
+- `SetGroupQuotas`：新增或覆盖指定分组的配额（值必须 > 0）；
+- `RemoveGroupQuotas`：去除指定分组的单独配额，回落到默认配额（目标必须存在）。
+
+规则与语义：
+
+- **原子生效**：所有校验（含"去除的配额必须存在""同组不能既设又删"等冲突
+  检测）都在任何修改之前完成；任一项非法则整次拒绝，返回可
+  `errors.Is(err, ErrInvalidConfigUpdate)` 判定的错误，配置保持原样。
+- **只影响后续调度**：正在执行的任务不受影响、照常跑完；排队任务继续被调度，
+  且任何时刻都不会突破**调整后**的并发上限与分组配额——调小上限时在跑任务
+  自然退出前不会补位新任务。
+- **关停后拒绝**：进入关停流程后调参返回 `ErrRuntimeClosed`。
+- `Config()` 返回当前生效配置的快照（`GroupQuotas` 为拷贝，可安全读取）。
+
+```go
+n := 8
+if err := rt.UpdateConfig(taskrt.ConfigUpdate{
+    MaxConcurrency: &n,
+    SetGroupQuotas: map[string]int{"batch": 4},
+}); err != nil { /* errors.Is(err, taskrt.ErrInvalidConfigUpdate) */ }
+```
+
+## 分组暂停与恢复
+
+- `PauseGroup(group)`：暂停指定分组。其**排队任务**在恢复前不得开始执行；
+  **已在执行**的任务自然结束；其它分组照常调度，不会被拖慢或饿死。幂等。
+- `ResumeGroup(group)`：恢复分组，排队任务重新参与公平调度（优先级 + 老化），
+  并遵守恢复当时生效的配额。幂等。
+- `IsPaused(group)`：查询暂停状态。
+- 暂停期间**提交、取消、超时语义不变**：提交照常入队（仍受排队容量约束），
+  `Handle.Cancel()` 照常把排队任务终结为 `Canceled`，每个任务仍恰好得到一个
+  终态，不会因暂停而卡死。
+- 与关停的交互：关停时被暂停分组的排队任务不会被执行，随 `ShutdownTimeout`
+  后的强制收敛一并终结为 `Canceled`（原因为强制关停），`Shutdown` 返回后
+  运行时彻底静止。
+
 ## 取消、超时与终态
 
 任务终态：`Completed` / `Failed` / `Canceled` / `TimedOut`（`Rejected` 仅出现在
@@ -104,5 +146,13 @@ go test -race -count=1 -v ./...
 测试覆盖：优先级饥饿（`TestPriorityNoStarvation`）、配额越界
 （`TestGroupQuotaNotExceeded`）、取消竞争（`TestCancelRace` 等）、
 关停边界（`TestShutdownDrains` / `TestShutdownForced`，含协程泄漏检查）、
-队列溢出（`TestQueueOverflow`）、混合负载开销（`TestMixedLoadOverhead`）。
+队列溢出（`TestQueueOverflow`）、混合负载开销（`TestMixedLoadOverhead`）、
+运行期调参（`TestUpdateMaxConcurrencyIncrease/Decrease`、
+`TestUpdateGroupQuotas`、`TestUpdateGroupQuotaDecrease`、
+`TestUpdateConfigInvalid`、`TestUpdateConfigAfterShutdown`）、
+分组暂停与恢复（`TestPauseGroupBlocksScheduling`、
+`TestPauseRunningTasksFinish`、`TestPauseDoesNotStarveOthers`、
+`TestPauseCancelAndSubmit`）、暂停分组随关停收敛
+（`TestShutdownWithPausedGroup`）以及调参/暂停与关停并发压力
+（`TestPauseResumeUpdateConcurrentShutdown`）。
 每个用例都在日志中打印输入参数与判定依据（`t.Logf`），可用 `-v` 复现结论。

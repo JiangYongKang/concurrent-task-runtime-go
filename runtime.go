@@ -53,6 +53,7 @@ type Runtime struct {
 	queue        []*entry
 	groupQueued  map[string]int
 	groupRunning map[string]int
+	pausedGroups map[string]bool
 	runningSet   map[*entry]struct{}
 	running      int
 	seq          uint64
@@ -69,6 +70,7 @@ func New(cfg Config) *Runtime {
 		queue:        nil,
 		groupQueued:  make(map[string]int),
 		groupRunning: make(map[string]int),
+		pausedGroups: make(map[string]bool),
 		runningSet:   make(map[*entry]struct{}),
 		drained:      make(chan struct{}),
 	}
@@ -151,6 +153,9 @@ func (r *Runtime) pickLocked() *entry {
 	best := -1
 	bestEff := 0
 	for i, e := range r.queue {
+		if r.pausedGroups[e.task.Group] {
+			continue // 被暂停的分组在恢复前不得开始执行
+		}
 		if q := r.cfg.quotaFor(e.task.Group); q > 0 && r.groupRunning[e.task.Group] >= q {
 			continue // 配额用尽的分组不得越额执行
 		}

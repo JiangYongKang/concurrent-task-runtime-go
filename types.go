@@ -1,5 +1,5 @@
 // Package taskrt 提供进程内并发任务运行时：优先级调度、分组配额、
-// 取消与超时、可观测统计以及优雅关停。
+// 取消与超时、可观测统计、优雅关停，以及运行期动态调参与分组暂停/恢复。
 package taskrt
 
 import (
@@ -94,10 +94,10 @@ func AsReject(err error) (*RejectError, bool) {
 
 // Task 描述一个待执行任务。
 type Task struct {
-	ID       string                            // 任务标识，为空时由运行时生成
-	Group    string                            // 归属分组，用于配额与公平调度
-	Priority int                               // 基础优先级，越大越优先
-	Timeout  time.Duration                     // 执行超时（从开始执行计时），0 表示不限制
+	ID       string                                 // 任务标识，为空时由运行时生成
+	Group    string                                 // 归属分组，用于配额与公平调度
+	Priority int                                    // 基础优先级，越大越优先
+	Timeout  time.Duration                          // 执行超时（从开始执行计时），0 表示不限制
 	Func     func(ctx context.Context) (any, error) // 任务体
 	// OnComplete 仅在任务真实完成（Completed/Failed）后调用；
 	// 被取消、超时或拒绝的任务不会触发回调。
@@ -109,8 +109,8 @@ type Result struct {
 	TaskID     string
 	Group      string
 	Status     Status
-	Value      any    // 仅 Completed 时有效
-	Err        error  // Failed 时为业务错误；Canceled/TimedOut/Rejected 时为原因说明
+	Value      any   // 仅 Completed 时有效
+	Err        error // Failed 时为业务错误；Canceled/TimedOut/Rejected 时为原因说明
 	EnqueuedAt time.Time
 	StartedAt  time.Time
 	FinishedAt time.Time
@@ -118,13 +118,13 @@ type Result struct {
 
 // Config 是运行时配置。
 type Config struct {
-	MaxConcurrency    int           // 并发执行上限，<=0 时取 4
-	QueueCapacity     int           // 全局排队容量，<=0 时取 1024
-	AgingInterval     time.Duration // 每等待该时长有效优先级 +1，防止饥饿；<=0 时取 100ms
-	DefaultGroupQuota int           // 分组默认并发配额，<=0 表示不限制
+	MaxConcurrency    int            // 并发执行上限，<=0 时取 4
+	QueueCapacity     int            // 全局排队容量，<=0 时取 1024
+	AgingInterval     time.Duration  // 每等待该时长有效优先级 +1，防止饥饿；<=0 时取 100ms
+	DefaultGroupQuota int            // 分组默认并发配额，<=0 表示不限制
 	GroupQuotas       map[string]int // 指定分组的并发配额，覆盖默认值
-	GroupQueueLimit   int           // 单分组排队上限，<=0 表示不限制
-	ShutdownTimeout   time.Duration // 优雅关停收敛时限，<=0 时取 5s
+	GroupQueueLimit   int            // 单分组排队上限，<=0 表示不限制
+	ShutdownTimeout   time.Duration  // 优雅关停收敛时限，<=0 时取 5s
 }
 
 func (c Config) withDefaults() Config {
