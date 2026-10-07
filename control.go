@@ -101,8 +101,9 @@ func (r *Runtime) Config() Config {
 
 // PauseGroup 暂停指定分组：其排队任务在恢复前不得开始执行，
 // 已在执行的任务自然结束；其它分组照常调度。幂等。
-// 暂停不影响提交、取消与超时语义；关停时被暂停分组的排队任务
-// 随强制收敛一并终结。
+// 暂停不影响提交、取消与超时语义。进入关停收敛阶段后暂停不再生效：
+// 被暂停分组的排队任务照常参与调度，在 ShutdownTimeout 内有机会跑完；
+// 时限耗尽仍未跑完的，随强制收敛以 ErrForcedShutdown 终结。
 func (r *Runtime) PauseGroup(group string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

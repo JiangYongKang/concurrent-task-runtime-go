@@ -182,20 +182,23 @@ func TestPauseCancelAndSubmit(t *testing.T) {
 	}
 }
 
-// TestShutdownWithPausedGroup 验证：关停时被暂停分组的排队任务被正常收敛，
+// TestShutdownWithPausedGroup 验证：关停开始时仍有分组处于暂停状态且留有排队任务，
+// 这些任务在收敛阶段照常参与调度并跑完，关停快速返回（不会干等到时限上限），
 // 关停返回后运行时彻底静止、无后台协程泄漏。
 func TestShutdownWithPausedGroup(t *testing.T) {
 	before := goruntime.NumGoroutine()
 
-	rt := New(Config{MaxConcurrency: 1, QueueCapacity: 16, ShutdownTimeout: 200 * time.Millisecond})
+	rt := New(Config{MaxConcurrency: 2, QueueCapacity: 16, ShutdownTimeout: 3 * time.Second})
 	rt.PauseGroup("p")
+	var ranP, ranN atomic.Int64
 	hp, err := rt.Submit(Task{ID: "p1", Group: "p", Func: func(ctx context.Context) (any, error) {
-		return nil, nil
+		ranP.Add(1)
+		time.Sleep(20 * time.Millisecond)
+		return "p1-done", nil
 	}})
 	if err != nil {
 		t.Fatalf("submit p1: %v", err)
 	}
-	var ranN atomic.Int64
 	hn, err := rt.Submit(Task{ID: "n1", Group: "n", Func: func(ctx context.Context) (any, error) {
 		ranN.Add(1)
 		return nil, nil
@@ -204,18 +207,27 @@ func TestShutdownWithPausedGroup(t *testing.T) {
 		t.Fatalf("submit n1: %v", err)
 	}
 
+	start := time.Now()
 	if err := rt.Shutdown(context.Background()); err != nil {
 		t.Fatalf("关停应收敛: %v", err)
 	}
+	elapsed := time.Since(start)
 	resP := hp.Wait()
 	resN := hn.Wait()
-	t.Logf("输入: 暂停 p 组, 排队 p1(组p) + n1(组n), 关停时限 200ms")
-	t.Logf("判定: p1 终态=%s (%v), n1 终态=%s", resP.Status, resP.Err, resN.Status)
+	t.Logf("输入: 暂停 p 组, 排队 p1(组p, 20ms) + n1(组n), 并发=2, 关停时限=3s")
+	t.Logf("判定: p1 终态=%s 值=%v, n1 终态=%s, 关停耗时=%v (时限 3s)", resP.Status, resP.Value, resN.Status, elapsed)
 	if resN.Status != StatusCompleted {
 		t.Fatalf("未暂停分组应在优雅期内跑完, 实际 %s", resN.Status)
 	}
-	if resP.Status != StatusCanceled {
-		t.Fatalf("被暂停分组的排队任务应被强制收敛为 Canceled, 实际 %s", resP.Status)
+	if resP.Status != StatusCompleted || resP.Value != "p1-done" {
+		t.Fatalf("被暂停分组的排队任务应在收敛阶段跑完, 实际 %s (%v)", resP.Status, resP.Err)
+	}
+	if ranP.Load() != 1 || ranN.Load() != 1 {
+		t.Fatalf("任务执行次数不符: p=%d, n=%d", ranP.Load(), ranN.Load())
+	}
+	// 任务只需约 20ms，关停不应等到 3s 时限。
+	if elapsed > time.Second {
+		t.Fatalf("关停被拖到时限上限: 耗时 %v", elapsed)
 	}
 	s := rt.Metrics()
 	t.Logf("统计快照: %+v", s)

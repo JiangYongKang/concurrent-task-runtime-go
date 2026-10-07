@@ -10,9 +10,12 @@ import (
 
 // 任务终态原因，用于 context.Cause 区分取消来源。
 var (
-	errUserCanceled   = errors.New("taskrt: task canceled by caller")
-	errTaskTimeout    = errors.New("taskrt: task execution timed out")
-	errForcedShutdown = errors.New("taskrt: runtime shutdown forced cancellation")
+	errUserCanceled = errors.New("taskrt: task canceled by caller")
+	errTaskTimeout  = errors.New("taskrt: task execution timed out")
+	// ErrForcedShutdown 是关停强制收敛时任务的取消原因：
+	// 排队任务的 Result.Err、执行中任务的 context.Cause 均为此值，
+	// 调用方可用 errors.Is 与主动取消、超时区分开。
+	ErrForcedShutdown = errors.New("taskrt: runtime shutdown forced cancellation")
 )
 
 // ErrShutdownTimeout 表示优雅关停未能在时限内收敛。
@@ -148,13 +151,15 @@ func (r *Runtime) dispatchLoop() {
 
 // pickLocked 扫描队列，选出有效优先级最高且分组配额未用尽的任务。
 // 复杂度 O(len(queue))，队列长度受 QueueCapacity 约束。
+// 关停收敛阶段（stateDraining）不再应用分组暂停：被暂停分组的排队任务
+// 照常参与调度，有机会在时限内跑完，而不是干等到强制收敛。
 func (r *Runtime) pickLocked() *entry {
 	now := time.Now()
 	best := -1
 	bestEff := 0
 	for i, e := range r.queue {
-		if r.pausedGroups[e.task.Group] {
-			continue // 被暂停的分组在恢复前不得开始执行
+		if r.state != stateDraining && r.pausedGroups[e.task.Group] {
+			continue // 被暂停的分组在恢复前不得开始执行（关停收敛阶段除外）
 		}
 		if q := r.cfg.quotaFor(e.task.Group); q > 0 && r.groupRunning[e.task.Group] >= q {
 			continue // 配额用尽的分组不得越额执行
@@ -375,7 +380,7 @@ func (r *Runtime) forceCancel() {
 			TaskID:     e.task.ID,
 			Group:      e.task.Group,
 			Status:     StatusCanceled,
-			Err:        errForcedShutdown,
+			Err:        ErrForcedShutdown,
 			EnqueuedAt: e.enqueuedAt,
 			FinishedAt: now,
 		})
@@ -394,7 +399,7 @@ func (r *Runtime) forceCancel() {
 		close(h.done)
 	}
 	for _, c := range cancels {
-		c(errForcedShutdown)
+		c(ErrForcedShutdown)
 	}
 	r.cond.Broadcast()
 }

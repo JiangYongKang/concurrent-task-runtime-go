@@ -88,9 +88,12 @@ if err := rt.UpdateConfig(taskrt.ConfigUpdate{
 - 暂停期间**提交、取消、超时语义不变**：提交照常入队（仍受排队容量约束），
   `Handle.Cancel()` 照常把排队任务终结为 `Canceled`，每个任务仍恰好得到一个
   终态，不会因暂停而卡死。
-- 与关停的交互：关停时被暂停分组的排队任务不会被执行，随 `ShutdownTimeout`
-  后的强制收敛一并终结为 `Canceled`（原因为强制关停），`Shutdown` 返回后
-  运行时彻底静止。
+- 与关停的交互：进入关停收敛阶段后，分组暂停**不再拦截调度**——被暂停
+  分组的排队任务照常参与调度（仍遵守并发上限与分组配额），在
+  `ShutdownTimeout` 内有机会跑完；只要并发与配额足够，它们会尽快执行完，
+  关停随之立即返回，不会空等时限上限。若时限耗尽仍未收敛，这些任务随
+  强制收敛以 `Canceled` 终结（原因可用 `errors.Is(err, ErrForcedShutdown)`
+  区分），`Shutdown` 返回后运行时彻底静止。
 
 ## 取消、超时与终态
 
@@ -128,9 +131,12 @@ if err := rt.UpdateConfig(taskrt.ConfigUpdate{
 `Shutdown(ctx)`：
 
 1. 立即拒收新任务（`RejectShutdown`），可重复调用（幂等）。
-2. 已排队与执行中的任务继续调度执行，在 `ShutdownTimeout`（默认 5s）内收敛。
-3. 超时后**强制收敛**：排队任务全部以 `Canceled` 终结，执行中任务的 `ctx`
-   被取消（`context.Cause` 为强制关停原因），再等待一个同等宽限期。
+2. 已排队与执行中的任务继续调度执行，在 `ShutdownTimeout`（默认 5s）内收敛；
+   此阶段分组暂停不再生效（见"分组暂停与恢复"），全部排队任务公平参与调度。
+3. 超时后**强制收敛**：排队任务全部以 `Canceled` 终结（`Result.Err` 为
+   `ErrForcedShutdown`），执行中任务的 `ctx` 被取消（`context.Cause` 同为
+   `ErrForcedShutdown`，可用 `errors.Is` 与主动取消、超时区分），
+   再等待一个同等宽限期。每个已提交任务都恰好拿到一个终态结论。
 4. 全部后台协程（调度协程 + 工作协程）退出后返回 `nil`。
    若任务体不响应 `ctx` 取消，宽限期后返回 `ErrShutdownTimeout`——
    Go 无法强杀 goroutine，任务体必须响应 `ctx` 才能保证无泄漏。
@@ -152,7 +158,17 @@ go test -race -count=1 -v ./...
 `TestUpdateConfigInvalid`、`TestUpdateConfigAfterShutdown`）、
 分组暂停与恢复（`TestPauseGroupBlocksScheduling`、
 `TestPauseRunningTasksFinish`、`TestPauseDoesNotStarveOthers`、
-`TestPauseCancelAndSubmit`）、暂停分组随关停收敛
-（`TestShutdownWithPausedGroup`）以及调参/暂停与关停并发压力
+`TestPauseCancelAndSubmit`）、暂停分组与关停叠加
+（`TestShutdownWithPausedGroup`：排队任务在收敛阶段跑完、关停快速返回；
+`TestShutdownPausedGroupDrainsWithQuota`：配额足够时全部完成且遵守配额；
+`TestShutdownPausedGroupForcedCancel`：时限不足时以 `ErrForcedShutdown`
+强制取消、每个任务拿到结论、无协程泄漏；
+`TestShutdownPausedGroupEveryTaskGetsVerdict`：部分跑完部分取消的混合场景）
+以及调参/暂停与关停并发压力
 （`TestPauseResumeUpdateConcurrentShutdown`）。
 每个用例都在日志中打印输入参数与判定依据（`t.Logf`），可用 `-v` 复现结论。
+针对暂停+关停场景可单独运行：
+
+```bash
+go test -race -count=1 -v -run 'TestShutdownWithPausedGroup|TestShutdownPausedGroup' .
+```
