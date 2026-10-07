@@ -10,9 +10,14 @@ import (
 
 // 任务终态原因，用于 context.Cause 区分取消来源。
 var (
-	errUserCanceled   = errors.New("taskrt: task canceled by caller")
-	errTaskTimeout    = errors.New("taskrt: task execution timed out")
-	errForcedShutdown = errors.New("taskrt: runtime shutdown forced cancellation")
+	errUserCanceled = errors.New("taskrt: task canceled by caller")
+	errTaskTimeout  = errors.New("taskrt: task execution timed out")
+
+	// ErrForcedShutdown 表示任务因优雅关停未能在时限内收敛而被强制取消：
+	// 排队任务直接以 Canceled 终结时，Result.Err 为本错误；执行中任务的
+	// ctx 被强制取消时，context.Cause(ctx) 与 Result.Err 同样为本错误，
+	// 调用方可用 errors.Is 将其与调用方主动取消、执行超时区分开。
+	ErrForcedShutdown = errors.New("taskrt: runtime shutdown forced cancellation")
 )
 
 // ErrShutdownTimeout 表示优雅关停未能在时限内收敛。
@@ -152,9 +157,14 @@ func (r *Runtime) pickLocked() *entry {
 	now := time.Now()
 	best := -1
 	bestEff := 0
+	// 关停收敛阶段暂停标记不再拦阻调度：暂停只是运行期的调度门禁，
+	// 而关停必须把已提交任务尽快收敛掉；此时让被暂停分组的排队任务
+	// 照常参与调度（仍受并发上限与分组配额约束），避免它们白白等到
+	// 关停时限耗尽才被强制取消。
+	ignorePause := r.state == stateDraining
 	for i, e := range r.queue {
-		if r.pausedGroups[e.task.Group] {
-			continue // 被暂停的分组在恢复前不得开始执行
+		if !ignorePause && r.pausedGroups[e.task.Group] {
+			continue // 正常运行期：被暂停的分组在恢复前不得开始执行
 		}
 		if q := r.cfg.quotaFor(e.task.Group); q > 0 && r.groupRunning[e.task.Group] >= q {
 			continue // 配额用尽的分组不得越额执行
@@ -306,10 +316,12 @@ func (r *Runtime) removeQueuedLocked(e *entry) {
 	}
 }
 
-// Shutdown 优雅关停：立即拒收新任务；已排队与执行中的任务在
-// ShutdownTimeout 内继续收敛；超时后强制取消排队任务并取消执行中
-// 任务的 ctx，再等待一个宽限期。任务体若不响应 ctx 取消，关停会
-// 返回 ErrShutdownTimeout（此时无法回收其工作协程，属任务体责任）。
+// Shutdown 优雅关停：立即拒收新任务；进入收敛阶段后，所有已排队任务
+// （含仍处于暂停状态分组的排队任务——暂停只是运行期门禁，不再拦阻关停
+// 收敛）与执行中任务在 ShutdownTimeout 内继续调度执行，调度仍受并发
+// 上限与分组配额约束；超时后强制取消排队任务并取消执行中任务的 ctx，
+// 再等待一个宽限期。任务体若不响应 ctx 取消，关停会返回
+// ErrShutdownTimeout（此时无法回收其工作协程，属任务体责任）。
 func (r *Runtime) Shutdown(ctx context.Context) error {
 	r.mu.Lock()
 	switch r.state {
@@ -375,7 +387,7 @@ func (r *Runtime) forceCancel() {
 			TaskID:     e.task.ID,
 			Group:      e.task.Group,
 			Status:     StatusCanceled,
-			Err:        errForcedShutdown,
+			Err:        ErrForcedShutdown,
 			EnqueuedAt: e.enqueuedAt,
 			FinishedAt: now,
 		})
@@ -394,7 +406,7 @@ func (r *Runtime) forceCancel() {
 		close(h.done)
 	}
 	for _, c := range cancels {
-		c(errForcedShutdown)
+		c(ErrForcedShutdown)
 	}
 	r.cond.Broadcast()
 }

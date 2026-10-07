@@ -88,9 +88,16 @@ if err := rt.UpdateConfig(taskrt.ConfigUpdate{
 - 暂停期间**提交、取消、超时语义不变**：提交照常入队（仍受排队容量约束），
   `Handle.Cancel()` 照常把排队任务终结为 `Canceled`，每个任务仍恰好得到一个
   终态，不会因暂停而卡死。
-- 与关停的交互：关停时被暂停分组的排队任务不会被执行，随 `ShutdownTimeout`
-  后的强制收敛一并终结为 `Canceled`（原因为强制关停），`Shutdown` 返回后
-  运行时彻底静止。
+- **与关停的交互**：暂停只是运行期的调度门禁，`Shutdown` 进入收敛阶段后
+  该门禁自动放开——被暂停分组的排队任务与其它任务一起参与调度，仍严格受
+  **并发上限与分组配额**约束：
+  - 只要并发空位与分组配额够用，这些任务会在收敛阶段被尽快调度执行完，
+    任务全部收敛后 `Shutdown` **立即返回**，不会等满 `ShutdownTimeout`；
+  - 若到 `ShutdownTimeout` 仍未收敛（例如没有并发空位、配额限速跑不完），
+    没来得及开始的排队任务被终结为 `Canceled`、`Result.Err` 为
+    `ErrForcedShutdown`（可用 `errors.Is` 区分于调用方主动取消），
+    执行中任务的 ctx 也以同一原因被取消；每个已提交任务都能等到终态结论，
+    `Shutdown` 返回后运行时彻底静止、不残留后台协程。
 
 ## 取消、超时与终态
 
@@ -105,6 +112,9 @@ if err := rt.UpdateConfig(taskrt.ConfigUpdate{
 - **三类失败区分上报**：业务失败（`Failed`，`Err` 为任务体返回的 error）、
   执行超时（`TimedOut`）、调度层拒绝（提交时返回 `*RejectError`）。
   任务体 panic 被 recover 并记为 `Failed`，不会污染运行时状态。
+- **取消原因可区分**：调用方主动取消与关停超时后的强制取消都表现为
+  `Canceled`，但后者的 `Result.Err`（以及执行中任务的 `context.Cause`）
+  为 `ErrForcedShutdown`，可用 `errors.Is` 区分。
 - 取消与完成的竞争由互斥锁 + `context.Cause` 裁定：每个任务**恰好**到达一个
   终态，`Handle.done` 恰好关闭一次。
 
@@ -129,8 +139,14 @@ if err := rt.UpdateConfig(taskrt.ConfigUpdate{
 
 1. 立即拒收新任务（`RejectShutdown`），可重复调用（幂等）。
 2. 已排队与执行中的任务继续调度执行，在 `ShutdownTimeout`（默认 5s）内收敛。
-3. 超时后**强制收敛**：排队任务全部以 `Canceled` 终结，执行中任务的 `ctx`
-   被取消（`context.Cause` 为强制关停原因），再等待一个同等宽限期。
+   收敛阶段**分组暂停不再拦阻调度**：被暂停分组的排队任务照常参与调度，
+   但并发上限与分组配额仍然生效，因此"能跑的尽快跑、跑不完的才取消"，
+   任务全部收敛完关停立即返回，不会无谓地耗满关停时限。
+3. 超时后**强制收敛**：排队任务全部以 `Canceled` 终结（`Result.Err` 为
+   `ErrForcedShutdown`），执行中任务的 `ctx` 被取消（`context.Cause` 同为
+   强制关停原因，可用 `errors.Is(res.Err, taskrt.ErrForcedShutdown)` 与
+   调用方取消、执行超时区分），再等待一个同等宽限期。每个已提交任务在
+   这一阶段都能拿到自己的终态结论，不会悬挂。
 4. 全部后台协程（调度协程 + 工作协程）退出后返回 `nil`。
    若任务体不响应 `ctx` 取消，宽限期后返回 `ErrShutdownTimeout`——
    Go 无法强杀 goroutine，任务体必须响应 `ctx` 才能保证无泄漏。
@@ -153,6 +169,11 @@ go test -race -count=1 -v ./...
 分组暂停与恢复（`TestPauseGroupBlocksScheduling`、
 `TestPauseRunningTasksFinish`、`TestPauseDoesNotStarveOthers`、
 `TestPauseCancelAndSubmit`）、暂停分组随关停收敛
-（`TestShutdownWithPausedGroup`）以及调参/暂停与关停并发压力
+（`TestShutdownWithPausedGroup`：排队任务在收敛期跑完且关停快速返回）、
+暂停 × 关停边界（`TestShutdownPausedGroupDrainRespectsQuotaAndFast`：
+额度足够全部跑完且关停不等时限；`TestShutdownPausedGroupForcedAllTerminal`：
+时限不够整体强制取消、原因可区分为 `ErrForcedShutdown` 且每个任务都有终态、
+无协程泄漏；`TestShutdownPausedGroupPartialDrain`：部分跑完、剩余强制取消）
+以及调参/暂停与关停并发压力
 （`TestPauseResumeUpdateConcurrentShutdown`）。
 每个用例都在日志中打印输入参数与判定依据（`t.Logf`），可用 `-v` 复现结论。

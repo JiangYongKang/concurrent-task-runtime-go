@@ -182,15 +182,17 @@ func TestPauseCancelAndSubmit(t *testing.T) {
 	}
 }
 
-// TestShutdownWithPausedGroup 验证：关停时被暂停分组的排队任务被正常收敛，
-// 关停返回后运行时彻底静止、无后台协程泄漏。
+// TestShutdownWithPausedGroup 验证：关停进入收敛阶段后，被暂停分组的
+// 排队任务不再被暂停标记拦阻，会与未暂停分组一起被尽快调度跑完；
+// 能立即跑完时关停快速返回（不等满关停时限），返回后运行时彻底静止、
+// 无后台协程泄漏。
 func TestShutdownWithPausedGroup(t *testing.T) {
 	before := goruntime.NumGoroutine()
 
-	rt := New(Config{MaxConcurrency: 1, QueueCapacity: 16, ShutdownTimeout: 200 * time.Millisecond})
+	rt := New(Config{MaxConcurrency: 1, QueueCapacity: 16, ShutdownTimeout: 2 * time.Second})
 	rt.PauseGroup("p")
 	hp, err := rt.Submit(Task{ID: "p1", Group: "p", Func: func(ctx context.Context) (any, error) {
-		return nil, nil
+		return "p1-done", nil
 	}})
 	if err != nil {
 		t.Fatalf("submit p1: %v", err)
@@ -204,18 +206,32 @@ func TestShutdownWithPausedGroup(t *testing.T) {
 		t.Fatalf("submit n1: %v", err)
 	}
 
+	// 暂停期间确认 p1 确实没有被调度（修复针对的正是“排队等待”这一状态）。
+	time.Sleep(100 * time.Millisecond)
+
+	start := time.Now()
 	if err := rt.Shutdown(context.Background()); err != nil {
 		t.Fatalf("关停应收敛: %v", err)
 	}
+	elapsed := time.Since(start)
 	resP := hp.Wait()
 	resN := hn.Wait()
-	t.Logf("输入: 暂停 p 组, 排队 p1(组p) + n1(组n), 关停时限 200ms")
-	t.Logf("判定: p1 终态=%s (%v), n1 终态=%s", resP.Status, resP.Err, resN.Status)
+	t.Logf("输入: 暂停 p 组, 排队 p1(组p) + n1(组n), 并发=1, 关停时限=2s")
+	t.Logf("判定: 关停耗时=%v (应远小于 2s), p1 终态=%s value=%v, n1 终态=%s",
+		elapsed, resP.Status, resP.Value, resN.Status)
 	if resN.Status != StatusCompleted {
 		t.Fatalf("未暂停分组应在优雅期内跑完, 实际 %s", resN.Status)
 	}
-	if resP.Status != StatusCanceled {
-		t.Fatalf("被暂停分组的排队任务应被强制收敛为 Canceled, 实际 %s", resP.Status)
+	if resP.Status != StatusCompleted {
+		t.Fatalf("被暂停分组的排队任务应在收敛阶段被调度跑完, 实际 %s (%v)", resP.Status, resP.Err)
+	}
+	if resP.Value != "p1-done" {
+		t.Fatalf("p1 结果值丢失: %v", resP.Value)
+	}
+	// 两个任务都是即时任务，并发=1 串行也应在毫秒级收敛；
+	// 若等满关停时限才返回（旧行为约 2s），说明暂停标记仍在拦阻调度。
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("关停耗时 %v 过长: 能立即跑完却等满了关停时限", elapsed)
 	}
 	s := rt.Metrics()
 	t.Logf("统计快照: %+v", s)
